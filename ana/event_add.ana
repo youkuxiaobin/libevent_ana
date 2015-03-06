@@ -1,0 +1,214 @@
+event_add 把event往当前event中的ev_base追加,如果需要定时，那么tv不能为空
+
+int
+event_add(struct event *ev, const struct timeval *tv)
+{
+	struct event_base *base = ev->ev_base;      //event_add 会把event加入到他的ev_base成员里
+	const struct eventop *evsel = base->evsel;  //对应linux的epoll相关函数
+	void *evbase = base->evbase;                //对应linux为 struct epollop
+    /*
+     * struct epollop
+     * {
+     *      struct evepoll *fds;                //分配nfiles个evepoll对象
+     *      int nfds;                           //支持的最大软限制数的句柄(上面的数组个数)
+     *      struct epoll_event* events;         //分配nfiles(软限制数) epoll_event对象
+     *      int nevents;                        //nevents保存着上面events个数
+     *      int epfd;                           //保存着epoll_create的句柄
+     * }
+     */
+	int res = 0;
+
+	event_debug((
+		 "event_add: event: %p, %s%s%scall %p",
+		 ev,
+		 ev->ev_events & EV_READ ? "EV_READ " : " ",
+		 ev->ev_events & EV_WRITE ? "EV_WRITE " : " ",
+		 tv ? "EV_TIMEOUT " : " ",
+		 ev->ev_callback));
+
+	assert(!(ev->ev_flags & ~EVLIST_ALL));
+
+	if (tv != NULL && !(ev->ev_flags & EVLIST_TIMEOUT)) {
+		if (min_heap_reserve(&base->timeheap,
+			1 + min_heap_size(&base->timeheap)) == -1)
+			return (-1);  /* ENOMEM == errno */
+	}
+
+	if ((ev->ev_events & (EV_READ|EV_WRITE|EV_SIGNAL)) &&
+	    !(ev->ev_flags & (EVLIST_INSERTED|EVLIST_ACTIVE))) {
+		res = evsel->add(evbase, ev);           //注册or修改事件到epoll中去
+		if (res != -1)
+			event_queue_insert(base, ev, EVLIST_INSERTED);  //把ev插入到eventqeue中去
+	}
+
+    /*
+     * 如果说插入事件成功同时设置了超时时间
+     */
+	if (res != -1 && tv != NULL) {
+		struct timeval now;
+
+        /* 
+         *如果已经存在了超时时间,那么就删除这个超时节点
+         */ 
+		if (ev->ev_flags & EVLIST_TIMEOUT)
+			event_queue_remove(base, ev, EVLIST_TIMEOUT);
+
+		/* Check if it is active due to a timeout.  Rescheduling
+		 * this timeout before the callback can be executed
+		 * removes it from the active list. */
+		if ((ev->ev_flags & EVLIST_ACTIVE) &&
+		    (ev->ev_res & EV_TIMEOUT)) {
+			/* See if we are just active executing this
+			 * event in a loop
+			 */
+			if (ev->ev_ncalls && ev->ev_pncalls) {
+				/* Abort loop */
+				*ev->ev_pncalls = 0;
+			}
+			
+			event_queue_remove(base, ev, EVLIST_ACTIVE);
+		}
+
+		gettime(base, &now);
+		evutil_timeradd(&now, tv, &ev->ev_timeout);
+
+		event_debug((
+			 "event_add: timeout in %ld seconds, call %p",
+			 tv->tv_sec, ev->ev_callback));
+
+		event_queue_insert(base, ev, EVLIST_TIMEOUT);//加入到最小超时堆中去
+	}
+
+	return (res);
+}
+如果新加的事件不为空，当前事件不是timeout时间，就为他在时间最小堆上分配一块可用空间(如果最小堆有空间，就不会重新分配)
+关于最小堆可以连接我的githup,libevent用最小堆来管理定时事件，根节点永远是最小的而且算法时间最小
+
+如果事件是EV_READ、EV_WRITE、EV_SIGNAL,并且事件不是插入or激活状态，那么就加入事件
+以epoll违例
+
+static int
+epoll_add(void *arg, struct event *ev)
+{
+	struct epollop *epollop = arg;
+	struct epoll_event epev = {0, {0}};
+	struct evepoll *evep;
+	int fd, op, events;
+
+    /*
+     * 信号的原理
+     * 1 设置信号处理函数，保存原来的信号处理函数到event的ev_base->sh_old中去
+     * 2 如果是首次添加信号，那么需要为所有信号追加一个信号事件来源自event->ev_base->ev_signal
+     *   同时设置event->ev_base->ev_signal->ev_signal_added,表示信号回调事件已经设置了
+     * 3 同时把事件追加到event->ev_base->ev_signal->evsigevents[signno]链表中去
+     */
+	if (ev->ev_events & EV_SIGNAL)  //如果是加入的信号
+		return (evsignal_add(ev));
+
+	fd = ev->ev_fd;
+	if (fd >= epollop->nfds) {
+		/* Extent the file descriptor array as necessary */
+        //如果说当前的epoll中已经满足不了新加入的句柄
+		if (epoll_recalc(ev->ev_base, epollop, fd) == -1)
+			return (-1);
+	}
+
+	evep = &epollop->fds[fd];
+	op = EPOLL_CTL_ADD;
+	events = 0;
+    //如果事件之前是可读
+	if (evep->evread != NULL) {
+		events |= EPOLLIN;
+		op = EPOLL_CTL_MOD;
+	}
+    //如果事件之前是可写
+	if (evep->evwrite != NULL) {
+		events |= EPOLLOUT;
+		op = EPOLL_CTL_MOD;
+	}
+
+    //新加入事件设置的是可读事件
+	if (ev->ev_events & EV_READ)
+		events |= EPOLLIN;
+    //新加入事件设置的是可写事件
+	if (ev->ev_events & EV_WRITE)
+		events |= EPOLLOUT;
+
+	epev.data.ptr = evep;
+	epev.events = events;
+	if (epoll_ctl(epollop->epfd, op, ev->ev_fd, &epev) == -1)
+			return (-1);
+
+	/* Update events responsible */
+	if (ev->ev_events & EV_READ)
+		evep->evread = ev;
+	if (ev->ev_events & EV_WRITE)
+		evep->evwrite = ev;
+
+	return (0);
+}
+信号追加，libevent对信号采用sockpair 创建两个互连socket，信号激发写可写sock，可读加入到事件循环中去
+根据信号ev_base->sig.evsigcaught[signumber]来判断该信号是否发生,下面是信号追加函数
+int
+evsignal_add(struct event *ev)
+{
+	int evsignal;
+	struct event_base *base = ev->ev_base;          //信号event的base
+	struct evsignal_info *sig = &ev->ev_base->sig;  //信号在ev_base的管理结构
+
+	if (ev->ev_events & (EV_READ|EV_WRITE))         //信号事件不支持可读可写事件
+		event_errx(1, "%s: EV_SIGNAL incompatible use", __func__);
+	evsignal = EVENT_SIGNAL(ev);                    //信号的fd就是信号number
+	assert(evsignal >= 0 && evsignal < NSIG);       //信号不能超过NSIG这个数
+	if (TAILQ_EMPTY(&sig->evsigevents[evsignal])) { //如果说该信号链表为空
+		event_debug(("%s: %p: changing signal handler", __func__, ev));
+        //设置信号处理函数，同时，保存原来的信号处理函数到ev_base->sh_old中去
+		if (_evsignal_set_handler(
+			    base, evsignal, evsignal_handler) == -1)
+			return (-1);
+
+		/* catch signals if they happen quickly */
+		evsignal_base = base;
+
+		if (!sig->ev_signal_added) {
+			if (event_add(&sig->ev_signal, NULL))
+				return (-1);
+			sig->ev_signal_added = 1;               //加入epoll_wait中去
+		}
+	}
+
+    //把ev->ev_signal_next加入到sig->evsigevents[evsignal]的链表末端
+	/* multiple events may listen to the same signal */
+	TAILQ_INSERT_TAIL(&sig->evsigevents[evsignal], ev, ev_signal_next);
+
+	return (0);
+}
+信号回调函数
+/*
+ * 所有的信号都通用一个信号处理函数
+ */
+static void
+evsignal_handler(int sig)
+{
+	int save_errno = errno;     //保存错误码
+
+	if (evsignal_base == NULL) {
+		event_warn(
+			"%s: received signal %d, but have no base configured",
+			__func__, sig);
+		return;
+	}
+
+	evsignal_base->sig.evsigcaught[sig]++;  //引起的信号number++
+	evsignal_base->sig.evsignal_caught = 1; //设置信号标志，表示信号已经触发
+
+#ifndef HAVE_SIGACTION
+	signal(sig, evsignal_handler);
+#endif
+
+	/* Wake up our notification mechanism */
+	send(evsignal_base->sig.ev_signal_pair[0], "a", 1, 0);  //通过写sockpair写数据来触发epoll_wait返回
+	errno = save_errno;
+}
+
+定时事件采用最小堆，定时值+当前事件最为左后超时时间，加入到最小堆中去，主要在event_base_dispatch中使用

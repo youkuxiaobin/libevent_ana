@@ -1,0 +1,95 @@
+libevent使用event来封装网络事件回调，参数、fd。。。等一些信息,函数很简单
+void
+event_set(struct event *ev, int fd, short events,
+	  void (*callback)(int, short, void *), void *arg)
+{
+	/* Take the current base - caller needs to set the real base later */
+	ev->ev_base = current_base; //设置成默认的current_base,如果
+
+	ev->ev_callback = callback; //设置事件回调callback;
+	ev->ev_arg = arg;           //设置参数
+	ev->ev_fd = fd;             //设置句柄
+	ev->ev_events = events;     //设置当前的事件
+    /*
+     * EV_TIMEOUT   0x01
+     * EV_READ      0x02
+     * EV_WRITE     0x04
+     * EV_SIGNAL    0x08
+     * EV_PERSIST   0x10
+     */
+	ev->ev_res = 0;             //记录当前激活事件的类型
+	ev->ev_flags = EVLIST_INIT; //设置事件标志，用于表示当前的事件处于什么阶段
+    /*
+     * EVLIST_TIMEOUT   0x01     //代表event在time堆中
+     * EVLIST_INSERTED  0x02     //代表event在已注册时间链表中
+     * EVLIST_SIGNAL    0x04     //未见使用
+     * EVLIST_ACTIVE    0x08     //代表event在激活链表中
+     * EVLIST_INTERNAL  0x10     //内部使用标记
+     * EVLIST_INIT      0x80     //代表event已经被初始化
+     */
+	ev->ev_ncalls = 0;           //代表callback被执行多少次
+	ev->ev_pncalls = NULL;       //指向ev_ncallsor指向NULL
+
+	min_heap_elem_init(ev);      //初始化时间堆中的索引值
+
+	/* by default, we put new events into the middle priority */
+	if(current_base)
+		ev->ev_pri = current_base->nactivequeues/2;//设置事件的权限为中间权限为默认值
+}
+使用libevent在多线程中，就会存在多个event_base来进行reactor事件模型, 就需要对struct event设置所归属的event_base
+调用的函数如下：
+int
+event_base_set(struct event_base *base, struct event *ev)
+{
+	/* Only innocent events may be assigned to a different base */
+	if (ev->ev_flags != EVLIST_INIT)//仅仅处在初始化中的事件对象才可以设置base,用于更新ev_base
+		return (-1);
+
+	ev->ev_base = base;
+	ev->ev_pri = base->nactivequeues/2;
+
+	return (0);
+}
+这样当每个线程都存在一个event_base的时候，那么就可以根据event所属的线程来设置当前的event_base,
+如果不设置event_base而使用默认,那么会使用current_base,current_base设置成最后一个创建的event_base对象
+
+设置事件权限，这个函数一般都是刚创建完event_base的使用，因为它使用的是current_base
+int
+event_priority_init(int npriorities)
+{
+  return event_base_priority_init(current_base, npriorities);
+}
+
+//重新设置event_base权限，一维是最高的。。。
+int
+event_base_priority_init(struct event_base *base, int npriorities)
+{
+	int i;
+
+	if (base->event_count_active)
+		return (-1);
+
+	if (base->nactivequeues && npriorities != base->nactivequeues) {
+		for (i = 0; i < base->nactivequeues; ++i) {
+			free(base->activequeues[i]);
+		}
+		free(base->activequeues);
+	}
+
+	/* Allocate our priority queues */
+	base->nactivequeues = npriorities;
+	base->activequeues = (struct event_list **)calloc(base->nactivequeues,
+	    npriorities * sizeof(struct event_list *));
+	if (base->activequeues == NULL)
+		event_err(1, "%s: calloc", __func__);
+
+	for (i = 0; i < base->nactivequeues; ++i) {
+		base->activequeues[i] = malloc(sizeof(struct event_list));
+		if (base->activequeues[i] == NULL)
+			event_err(1, "%s: malloc", __func__);
+		TAILQ_INIT(base->activequeues[i]);
+	}
+
+	return (0);
+}
+

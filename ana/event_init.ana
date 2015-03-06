@@ -1,0 +1,127 @@
+libevent采用的是经典的reactor网络框架，集成了信号、定时、网络事件于一体
+首先对event_init进行源码剖析
+
+event_init 主要创建event_base对象，
+
+struct event_base {
+	const struct eventop *evsel;      //lievent支持select epoll kequeue..等网络api,包括init、add、del、dispatch的接口,每种网络框架都支持
+	void *evbase;                     //支持相应网络api的 结构对象，必须epoll就是epoll_create返回epfd相关的内容,
+    //因为每种网络接口都不一样，所以需要使用void*
+	int event_count;		          //总网络事件数
+	int event_count_active;	          //激活事件数
+
+	int event_gotterm;		         //event_base_dispatch中终止while循环
+	int event_break;		         //event_base_dispatch终止while立刻
+
+	struct event_list **activequeues;//用于保存激活事件列表，是一个二维数组,第一维用于权限number，越低越高，第二维为激活列表
+	int nactivequeues;              // 激活权限列表有多少个权限
+
+	struct evsignal_info sig;       //保存着信号相关的内容
+
+	struct event_list eventqueue;   //保存着注册的事件列表
+	struct timeval event_tv;        //用于和tv_cache确定是否时间被修改了，如果使用monotonic时间是不被修改的，gettimeofday才会用到
+
+	struct min_heap timeheap;       //用于时间堆（最小堆）管理
+
+	struct timeval tv_cache;
+};
+代码如下
+struct event_base *
+event_init(void)
+{
+	struct event_base *base = event_base_new();
+
+	if (base != NULL)
+		current_base = base;//如果创建成功那么就会把current_base更新为新创建的base
+
+	return (base);
+}
+
+event_init 此函数用于对外提供接口,主要完成的初始化event_base对象，同时如果cc创建成功那么就把current_base指向新创建的event_base,用于默认event_base
+下面是创建和初始化event_base整个函数
+struct event_base *
+event_base_new(void)
+{
+	int i;
+	struct event_base *base;
+
+    //先创建一个even_base对象
+	if ((base = calloc(1, sizeof(struct event_base))) == NULL)
+		event_err(1, "%s: calloc", __func__);
+
+	event_sigcb = NULL;
+	event_gotsig = 0;
+
+    //检测系统是否可以使用MONOTONIC time
+	detect_monotonic();
+    //填充base->event_tv记录创建base的时间
+	gettime(base, &base->event_tv);
+	
+    //初始化最小定时器堆，p n a都置为0
+	min_heap_ctor(&base->timeheap);
+    //初始化队列first = NULL and last = &first
+	TAILQ_INIT(&base->eventqueue);
+    //初始化用于信号通信的socket,使用的是sockpair unix网络套接字
+	base->sig.ev_signal_pair[0] = -1;
+	base->sig.ev_signal_pair[1] = -1;
+	
+	base->evbase = NULL;
+	for (i = 0; eventops[i] && !base->evbase; i++) {
+        //event会优先选择epoll，这个数组是按照索引优先权下降
+		base->evsel = eventops[i];
+
+		base->evbase = base->evsel->init(base);
+	}
+
+	if (base->evbase == NULL)
+		event_errx(1, "%s: no event mechanism available", __func__);
+
+	if (getenv("EVENT_SHOW_METHOD")) 
+		event_msgx("libevent using: %s\n",
+			   base->evsel->name);
+
+	/* allocate a single active event queue */
+	event_base_priority_init(base, 1);
+
+	return (base);
+}
+detect_monotonic用于检测当前使用的时间更新机制，查看是否可以调用clock_m_geeettime函数来设置use_monotonic
+getttime用于初始化event_tv
+min_head_ctor初始化最小堆数组结构，a n p
+TAIL_INIT(&base->event_tv)用于初始化注册事件双向链表
+整个for循环是为了选取最优的网络接口模型，同时初始化这个网络模型数据结构
+下面是初始化激活网络事件权限
+int
+event_base_priority_init(struct event_base *base, int npriorities)
+{
+	int i;
+
+	if (base->event_count_active)
+		return (-1);
+    //先释放
+	if (base->nactivequeues && npriorities != base->nactivequeues) {
+		for (i = 0; i < base->nactivequeues; ++i) {
+			free(base->activequeues[i]);
+		}
+		free(base->activequeues);
+	}
+
+	/* Allocate our priority queues */
+    //先分配一维权限数组
+	base->nactivequeues = npriorities;
+	base->activequeues = (struct event_list **)calloc(base->nactivequeues,
+	    npriorities * sizeof(struct event_list *));
+	if (base->activequeues == NULL)
+		event_err(1, "%s: calloc", __func__);
+
+    //再初始化二维激活事件列表
+	for (i = 0; i < base->nactivequeues; ++i) {
+		base->activequeues[i] = malloc(sizeof(struct event_list));
+		if (base->activequeues[i] == NULL)
+			event_err(1, "%s: malloc", __func__);
+		TAILQ_INIT(base->activequeues[i]);
+	}
+
+	return (0);
+}
+

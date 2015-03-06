@@ -1,0 +1,233 @@
+分析下事件循环
+
+int
+event_base_dispatch(struct event_base *event_base)
+{
+  return (event_base_loop(event_base, 0));
+}
+int
+event_base_loop(struct event_base *base, int flags)
+{
+	const struct eventop *evsel = base->evsel;
+	void *evbase = base->evbase;
+	struct timeval tv;
+	struct timeval *tv_p;
+	int res, done;
+
+	/* clear time cache */
+	base->tv_cache.tv_sec = 0;
+
+	if (base->sig.ev_signal_added)
+		evsignal_base = base;                       //如果说当前ev_base已经加入了信号事件，那么就把ev_signal_base指向他
+	done = 0;
+	while (!done) {
+        //终止事件循环
+		/* Terminate the loop if we have been asked to */
+		if (base->event_gotterm) {
+			base->event_gotterm = 0;
+			break;
+		}
+
+		if (base->event_break) {
+			base->event_break = 0;
+			break;
+		}
+
+		/* You cannot use this interface for multi-threaded apps */
+		while (event_gotsig) {
+			event_gotsig = 0;
+			if (event_sigcb) {
+				res = (*event_sigcb)();
+				if (res == -1) {
+					errno = EINTR;
+					return (-1);
+				}
+			}
+		}
+        /* 这个函数就是获取当前时间保存在tv中，如果时间变化了，需要更新时间最小堆中的时间,主要是获取当前时间 */
+		timeout_correct(base, &tv);
+
+		tv_p = &tv;
+		if (!base->event_count_active && !(flags & EVLOOP_NONBLOCK)) {
+			timeout_next(base, &tv_p);
+		} else {
+			/* 
+			 * if we have active events, we just poll new events
+			 * without waiting.
+			 */
+            /*
+             * 如果说还存在激活事件，那么就清除掉时间
+             */
+			evutil_timerclear(&tv);
+		}
+		
+		/* If we have no events, we just exit */
+		if (!event_haveevents(base)) {
+			event_debug(("%s: no events registered.", __func__));
+			return (1);
+		}
+
+		/* update last old time */
+		gettime(base, &base->event_tv);
+
+		/* clear time cache */
+		base->tv_cache.tv_sec = 0;//清0是为了当有激活事件的时候，获取系统最新时间
+
+		res = evsel->dispatch(base, evbase, tv_p);
+
+		if (res == -1)
+			return (-1);
+		gettime(base, &base->tv_cache);//这里是每次通过系统调用获取的时间
+
+        //处理超时事件，删除超时链表节点，同时加入到激活链表
+		timeout_process(base);
+
+		if (base->event_count_active) {
+			event_process_active(base);
+			if (!base->event_count_active && (flags & EVLOOP_ONCE))
+				done = 1;
+		} else if (flags & EVLOOP_NONBLOCK)
+			done = 1;
+	}
+
+	/* clear time cache */
+	base->tv_cache.tv_sec = 0;
+
+	event_debug(("%s: asked to terminate loop.", __func__));
+	return (0);
+}
+1 关于时间更新问题，主要利用了ev_base->tv_cache 和 ev_base->event_tv这两个时间，前者是事件触发钱的tv_cache时间(第一次不是）
+ 后者是激活事件放入到激活链表后的时间，如果tv_cache小于event_tv那么时间就被更新了，在timeout_correct中处理
+static void
+timeout_correct(struct event_base *base, struct timeval *tv)
+{
+	struct event **pev;
+	unsigned int size;
+	struct timeval off;
+
+	if (use_monotonic)
+		return;
+
+    /* 这里如果返回表示时间未更新 */
+	/* Check if time is running backwards */
+	gettime(base, tv);
+	if (evutil_timercmp(tv, &base->event_tv, >=)) {
+		base->event_tv = *tv;
+		return;
+	}
+
+	event_debug(("%s: time is running backwards, corrected",
+		    __func__));
+	evutil_timersub(&base->event_tv, tv, &off);
+
+	/*
+	 * We can modify the key element of the node without destroying
+	 * the key, beause we apply it to all in the right order.
+	 */
+	pev = base->timeheap.p;
+	size = base->timeheap.n;
+	for (; size-- > 0; ++pev) {
+		struct timeval *ev_tv = &(**pev).ev_timeout;
+		evutil_timersub(ev_tv, &off, ev_tv);
+	}
+}
+2 以epoll为例。 evsel->dispatch就是调用epollop中epoll的dispatch函数
+static int
+epoll_dispatch(struct event_base *base, void *arg, struct timeval *tv)
+{
+	struct epollop *epollop = arg;
+	struct epoll_event *events = epollop->events;
+	struct evepoll *evep;
+	int i, res, timeout = -1;
+
+	if (tv != NULL)
+		timeout = tv->tv_sec * 1000 + (tv->tv_usec + 999) / 1000;
+
+	if (timeout > MAX_EPOLL_TIMEOUT_MSEC) {
+		/* Linux kernels can wait forever if the timeout is too big;
+		 * see comment on MAX_EPOLL_TIMEOUT_MSEC. */
+		timeout = MAX_EPOLL_TIMEOUT_MSEC;
+	}
+
+	res = epoll_wait(epollop->epfd, events, epollop->nevents, timeout);
+
+	if (res == -1) {
+		if (errno != EINTR) {
+			event_warn("epoll_wait");
+			return (-1);
+		}
+
+		evsignal_process(base);
+		return (0);
+	} else if (base->sig.evsignal_caught) {
+		evsignal_process(base);
+	}
+
+	event_debug(("%s: epoll_wait reports %d", __func__, res));
+
+	for (i = 0; i < res; i++) {
+		int what = events[i].events;
+		struct event *evread = NULL, *evwrite = NULL;
+
+		evep = (struct evepoll *)events[i].data.ptr;
+
+		if (what & (EPOLLHUP|EPOLLERR)) {
+			evread = evep->evread;
+			evwrite = evep->evwrite;
+		} else {
+			if (what & EPOLLIN) {
+				evread = evep->evread;
+			}
+
+			if (what & EPOLLOUT) {
+				evwrite = evep->evwrite;
+			}
+		}
+
+		if (!(evread||evwrite))
+			continue;
+
+		if (evread != NULL)
+			event_active(evread, EV_READ, 1);
+		if (evwrite != NULL)
+			event_active(evwrite, EV_WRITE, 1);
+	}
+
+	return (0);
+}
+3 剩下的就是遍历激活链表处理事件回调
+static void
+event_process_active(struct event_base *base)
+{
+	struct event *ev;
+	struct event_list *activeq = NULL;
+	int i;
+	short ncalls;
+
+	for (i = 0; i < base->nactivequeues; ++i) {
+		if (TAILQ_FIRST(base->activequeues[i]) != NULL) {
+			activeq = base->activequeues[i];
+			break;
+		}
+	}
+
+	assert(activeq != NULL);
+
+	for (ev = TAILQ_FIRST(activeq); ev; ev = TAILQ_FIRST(activeq)) {
+		if (ev->ev_events & EV_PERSIST)
+			event_queue_remove(base, ev, EVLIST_ACTIVE);
+		else
+			event_del(ev);
+		
+		/* Allows deletes to work */
+		ncalls = ev->ev_ncalls;
+		ev->ev_pncalls = &ncalls;
+		while (ncalls) {
+			ncalls--;
+			ev->ev_ncalls = ncalls;
+			(*ev->ev_callback)((int)ev->ev_fd, ev->ev_res, ev->ev_arg);
+			if (event_gotsig || base->event_break)
+				return;
+		}
+	}
+}
